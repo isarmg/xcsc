@@ -692,6 +692,9 @@ fn xcsc_failure_message(code: &str) -> &'static str {
         }
         "permission_denied" => "The operation was denied by the operating system.",
         "busy" => "The client state or service is currently in use.",
+        "log_snapshot_busy" => {
+            "The log writer is rotating or initializing its files. Try again shortly."
+        }
         "service_timeout" => {
             "The service manager did not reach the requested state before the timeout."
         }
@@ -818,6 +821,51 @@ pub fn query_rotating_logs(
     Ok(json!({"entries":entries,"source":"private-runtime-log","retention_bytes":40*1024*1024}))
 }
 
+/// Capture a coherent Windows generation set, releasing the reader gate before decoding.
+#[cfg(windows)]
+pub fn query_windows_rotating_logs(
+    args: &Args,
+    stem: &str,
+    directory: &crate::fs_safety::PrivateDirectory,
+    mut read_part: impl FnMut(&str) -> Result<Option<Vec<u8>>>,
+    decode: impl FnMut(&[u8]) -> Result<Vec<Value>>,
+) -> Result<Value> {
+    let guard =
+        crate::log::RotatingLogFile::acquire_read_guard(directory, stem).map_err(|error| {
+            match error {
+                crate::log::LogError::Io(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    fail(5, "log_snapshot_busy")
+                }
+                _ => fail(8, "unsafe_or_unreadable_runtime_log"),
+            }
+        })?;
+    let mut captured = BTreeMap::new();
+    for slot in (0..=4).rev() {
+        let name = if slot == 0 {
+            format!("{stem}.jsonl")
+        } else {
+            format!("{stem}.jsonl.{slot}")
+        };
+        let bytes = read_part(&name)?
+            .map(|bytes| {
+                if bytes.len() > 8 * 1024 * 1024 {
+                    return Err(fail(8, "log_budget_exceeded"));
+                }
+                read_tail_lines(&mut io::Cursor::new(bytes), 1024 * 1024, 16 * 1024)
+                    .map_err(|_| fail(8, "log_integrity_or_budget_failed"))
+            })
+            .transpose()?;
+        captured.insert(name, bytes);
+    }
+    drop(guard);
+    query_rotating_logs(
+        args,
+        stem,
+        |name| Ok(captured.remove(name).flatten()),
+        decode,
+    )
+}
+
 pub fn follow_logs<C: ProductErrorCatalog + ?Sized>(
     product: &str,
     service: &Service,
@@ -852,14 +900,16 @@ pub fn follow_log_source<C: ProductErrorCatalog + ?Sized>(
     };
     rt.block_on(async {let deadline=tokio::time::Instant::now()+args.timeout;loop {
         let result=source(&args);
+        let snapshot_busy;
         match result {
+            Err(e) if e.code == "log_snapshot_busy" => {snapshot_busy=true;},
             Err(e)=>return emit(product,"logs","ndjson",&Err(e),product_errors),
-            Ok(value)=>if let Some(entries)=value["entries"].as_array(){for entry in entries {
+            Ok(value)=>{snapshot_busy=false;if let Some(entries)=value["entries"].as_array(){for entry in entries {
                 if let Some(cursor)=entry["cursor"].as_str(){args.options.insert("--log-cursor".into(),cursor.into());}
                 let code=emit(product,"logs","ndjson",&Ok(entry.clone()),product_errors);if code!=0{return code;}
-            }},
+            }}},
         }
-        tokio::select!{_=tokio::signal::ctrl_c()=>return 130,_=tokio::time::sleep_until(deadline)=>return 0,_=tokio::time::sleep(Duration::from_secs(1))=>{}}
+        tokio::select!{_=tokio::signal::ctrl_c()=>return 130,_=tokio::time::sleep_until(deadline)=>return if snapshot_busy {emit(product,"logs","ndjson",&Err(fail(5,"log_snapshot_busy")),product_errors)} else {0},_=tokio::time::sleep(Duration::from_secs(1))=>{}}
     }})
 }
 
@@ -1419,5 +1469,42 @@ mod rotating_query_tests {
         )
         .unwrap_err();
         assert_eq!(err.code, "malformed_log");
+    }
+}
+
+#[cfg(test)]
+mod snapshot_follow_tests {
+    use super::*;
+    #[test]
+    fn snapshot_busy_deadline_returns_retryable_error_without_cursor_advance() {
+        let mut args = Args::parse(vec!["logs".into()], &[], &[]).unwrap();
+        args.timeout = Duration::ZERO;
+        let code = follow_log_source("fixture", args, &NoProductErrorCatalog, |args| {
+            assert_eq!(args.get("--log-cursor"), None);
+            Err(fail(5, "log_snapshot_busy"))
+        });
+        assert_eq!(code, 5);
+    }
+    #[test]
+    fn snapshot_busy_follow_retries_with_same_cursor_then_recovers() {
+        let mut args = Args::parse(vec!["logs".into()], &[], &[]).unwrap();
+        args.timeout = Duration::from_millis(2500);
+        let mut calls = 0;
+        let code = follow_log_source("fixture", args, &NoProductErrorCatalog, |args| {
+            calls += 1;
+            if calls == 1 {
+                assert_eq!(args.get("--log-cursor"), None);
+                Ok(json!({"entries":[{"cursor":"before"}]}))
+            } else {
+                assert_eq!(args.get("--log-cursor"), Some("before"));
+                if calls == 2 {
+                    Err(fail(5, "log_snapshot_busy"))
+                } else {
+                    Ok(json!({"entries":[]}))
+                }
+            }
+        });
+        assert_eq!(code, 0);
+        assert_eq!(calls, 3);
     }
 }
