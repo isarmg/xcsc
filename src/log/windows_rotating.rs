@@ -17,6 +17,7 @@ use std::{
     },
     path::{Component, Path, PathBuf, Prefix},
     ptr,
+    time::{Duration, Instant},
 };
 use windows_sys::Win32::{
     Foundation::{
@@ -604,6 +605,7 @@ pub struct RotatingLogFile {
     _directories: Vec<File>,
     private_anchor: Option<usize>,
     _writer: File,
+    read_gate: File,
     path: PathBuf,
     access: WindowsLogAccess,
     active: String,
@@ -613,7 +615,62 @@ pub struct RotatingLogFile {
     failed: bool,
 }
 
+struct ReadGuard(crate::fs_safety::WindowsPrivateFile);
+impl Drop for ReadGuard {
+    fn drop(&mut self) {
+        let _ = self.0.file().unlock();
+    }
+}
+struct RotationGuard<'a>(&'a File);
+impl Drop for RotationGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+fn rotation_guard(file: &File, timeout: Duration) -> Result<RotationGuard<'_>, LogError> {
+    let start = Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(RotationGuard(file)),
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                let remaining = timeout.saturating_sub(start.elapsed());
+                if remaining.is_zero() {
+                    return Err(LogError::ReaderBusy);
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(5)));
+            }
+        }
+    }
+}
+
 impl RotatingLogFile {
+    /// Hold only while capturing bounded bytes, never while decoding or emitting.
+    /// Existing-only: readers cannot create a protocol marker for an old writer.
+    pub fn acquire_read_guard(
+        directory: &crate::fs_safety::PrivateDirectory,
+        stem: &str,
+    ) -> Result<impl Drop, LogError> {
+        use crate::fs_safety::{EntryName, PrivateFileAccess};
+        if stem.is_empty()
+            || !stem
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        {
+            return Err(LogError::InvalidLimits);
+        }
+        let name = EntryName::new(format!(".{stem}.jsonl.read.lock"))
+            .map_err(|_| LogError::UnsafeStorage)?;
+        let gate = directory
+            .open_private_file(&name, PrivateFileAccess::ReadOnly)
+            .map_err(|_| LogError::UnsafeStorage)?;
+        gate.file().try_lock_shared().map_err(|error| match error {
+            std::fs::TryLockError::WouldBlock => LogError::Io(io::ErrorKind::WouldBlock.into()),
+            std::fs::TryLockError::Error(error) => LogError::Io(error),
+        })?;
+        Ok(ReadGuard(gate))
+    }
+
     /// Create only the final private log directory below already-existing
     /// application state. Existing metadata is never changed or repaired.
     #[allow(unsafe_code)]
@@ -721,6 +778,9 @@ impl RotatingLogFile {
         verify_chain(&directories, private_anchor, &access)?;
         let writer = private_file(&path.join(format!(".{active}.writer.lock")), &access)?;
         writer.try_lock().map_err(|_| LogError::UnsafeStorage)?;
+        let gate_name = format!(".{active}.read.lock");
+        let read_gate = private_file(&path.join(&gate_name), &access)?;
+        let initialization = rotation_guard(&read_gate, Duration::from_secs(5))?;
         let mut entries = 0;
         for entry in fs::read_dir(path)? {
             entries += 1;
@@ -729,7 +789,7 @@ impl RotatingLogFile {
             }
             let name = entry?.file_name();
             let name = name.to_str().ok_or(LogError::UnsafeStorage)?;
-            if name == active || name == format!(".{active}.writer.lock") {
+            if name == active || name == format!(".{active}.writer.lock") || name == gate_name {
                 continue;
             }
             let index = name
@@ -759,10 +819,12 @@ impl RotatingLogFile {
         if bytes > retention.file_bytes {
             return Err(LogError::InvalidLimits);
         }
+        drop(initialization);
         Ok(Self {
             _directories: directories,
             private_anchor,
             _writer: writer,
+            read_gate,
             path: path.into(),
             access,
             active,
@@ -779,7 +841,7 @@ impl RotatingLogFile {
         }
         let line = record.json_line()?;
         let result = self.write_line(&line);
-        if result.is_err() {
+        if result.is_err() && !matches!(&result, Err(LogError::ReaderBusy)) {
             self.failed = true;
         }
         result
@@ -818,7 +880,9 @@ impl RotatingLogFile {
             return Err(LogError::UnsafeStorage);
         }
         information(&self._writer, false)?;
-        verify_acl(&self._writer, &self.access, false)
+        verify_acl(&self._writer, &self.access, false)?;
+        information(&self.read_gate, false)?;
+        verify_acl(&self.read_gate, &self.access, false)
     }
 
     fn archive(&self, index: u8) -> PathBuf {
@@ -863,6 +927,7 @@ impl RotatingLogFile {
         }
         active.sync_all()?;
         self.verify_namespace()?;
+        let _rotation = rotation_guard(&self.read_gate, Duration::from_secs(5))?;
         self.file.take();
         if self.checked_archive(self.retention.archives)? {
             self.verify_namespace()?;

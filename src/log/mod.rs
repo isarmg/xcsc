@@ -676,6 +676,8 @@ pub enum LogError {
     InvalidLimits,
     #[error("log storage must be a private directory with private regular files and one writer")]
     UnsafeStorage,
+    #[error("a log reader is busy; this record was not written and may be retried")]
+    ReaderBusy,
     #[error("log I/O failed: {0}")]
     Io(#[from] io::Error),
 }

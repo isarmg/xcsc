@@ -1008,6 +1008,11 @@ fn protect_fixture_log_objects(path: &Path, policy: &WindowsLogAccess, sink: &Ro
         policy,
         false,
     );
+    replace_fixture_dacl(
+        &path.join(format!(".{}.read.lock", sink.active)),
+        policy,
+        false,
+    );
     replace_fixture_dacl(&path.join(&sink.active), policy, false);
     replace_fixture_dacl(path, policy, true);
     for (file, directory, stage) in [
@@ -1017,6 +1022,7 @@ fn protect_fixture_log_objects(path: &Path, policy: &WindowsLogAccess, sink: &Ro
             "protected log directory",
         ),
         (&sink._writer, false, "protected writer"),
+        (&sink.read_gate, false, "protected read gate"),
         (sink.file.as_ref().unwrap(), false, "protected active"),
     ] {
         let acl = require_fixture_acl(file, policy, directory, stage);
@@ -1194,4 +1200,345 @@ fn service_final_directory_owner_is_rechecked_after_open() {
         Err(LogError::UnsafeStorage)
     ));
     assert_eq!(fs::read(active).unwrap(), before);
+}
+
+fn gate_args(tail: usize) -> crate::cli::Args {
+    crate::cli::Args::parse(
+        vec!["logs".into(), "--tail".into(), tail.to_string()],
+        &[],
+        &[],
+    )
+    .unwrap()
+}
+fn gate_decode(bytes: &[u8]) -> crate::cli::Result<Vec<serde_json::Value>> {
+    query(
+        std::io::Cursor::new(bytes),
+        LogFilter::default(),
+        QueryLimits {
+            max_input_bytes: 1024 * 1024,
+            max_records: 16384,
+        },
+    )
+    .map_err(crate::cli::storage_error)?
+    .into_iter()
+    .map(|r| serde_json::to_value(r).map_err(crate::cli::storage_error))
+    .collect()
+}
+fn gate_read(
+    directory: &crate::fs_safety::PrivateDirectory,
+    name: &str,
+) -> crate::cli::Result<Option<Vec<u8>>> {
+    use crate::fs_safety::{EntryName, Error};
+    match directory.read_private_bounded(&EntryName::new(name).unwrap(), 8 * 1024 * 1024) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(Error::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(crate::cli::storage_error(error)),
+    }
+}
+fn gate_query(
+    directory: &crate::fs_safety::PrivateDirectory,
+    args: &crate::cli::Args,
+) -> serde_json::Value {
+    crate::cli::query_windows_rotating_logs(
+        args,
+        "service",
+        directory,
+        |n| gate_read(directory, n),
+        gate_decode,
+    )
+    .unwrap()
+}
+fn gate_ids(value: &serde_json::Value) -> Vec<&str> {
+    value["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["instance_id"].as_str().unwrap())
+        .collect()
+}
+
+#[test]
+fn reader_gate_preserves_b_and_c_under_concurrent_native_rotation() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("logs");
+    let mut sink = RotatingLogFile::create_private(
+        &path,
+        "service",
+        LogRetention {
+            file_bytes: MAX_RECORD_BYTES as u64,
+            archives: 4,
+        },
+    )
+    .unwrap();
+    let directory = crate::fs_safety::PrivateDirectory::open_existing(&path).unwrap();
+    let a = record("a")
+        .with_attribute("padding", "x".repeat(9000))
+        .unwrap();
+    let b = record("b")
+        .with_attribute("padding", "x".repeat(9000))
+        .unwrap();
+    let c = record("c")
+        .with_attribute("padding", "x".repeat(9000))
+        .unwrap();
+    for r in [&a, &b, &c] {
+        let n = r.json_line().unwrap().len();
+        assert!(n <= MAX_RECORD_BYTES && n * 2 > MAX_RECORD_BYTES);
+    }
+    // Fill retention first so the concurrent rotation also deletes the oldest archive.
+    for id in ["old-1", "old-2", "old-3", "old-4"] {
+        sink.write(
+            &record(id)
+                .with_attribute("padding", "x".repeat(9000))
+                .unwrap(),
+        )
+        .unwrap();
+    }
+    sink.write(&a).unwrap();
+    let mut args = gate_args(10);
+    let first = gate_query(&directory, &args);
+    args.options.insert(
+        "--log-cursor".into(),
+        first["entries"].as_array().unwrap().last().unwrap()["cursor"]
+            .as_str()
+            .unwrap()
+            .into(),
+    );
+    sink.write(&b).unwrap();
+    let (start_tx, start_rx) = std::sync::mpsc::channel();
+    let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        start_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(
+            sink.read_gate.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        blocked_tx.send(()).unwrap();
+        sink.write(&c).unwrap();
+        sink
+    });
+    let during = crate::cli::query_windows_rotating_logs(
+        &args,
+        "service",
+        &directory,
+        |name| {
+            let bytes = gate_read(&directory, name)?;
+            if name == "service.jsonl.1" {
+                start_tx.send(()).unwrap();
+                blocked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            Ok(bytes)
+        },
+        gate_decode,
+    )
+    .unwrap();
+    assert_eq!(gate_ids(&during), ["b"]);
+    let mut sink = writer.join().unwrap();
+    args.options.insert(
+        "--log-cursor".into(),
+        during["entries"][0]["cursor"].as_str().unwrap().into(),
+    );
+    let next = gate_query(&directory, &args);
+    assert_eq!(gate_ids(&next), ["c"]);
+    sink.write(&record("d")).unwrap();
+}
+
+#[test]
+fn reader_gate_releases_before_decode_and_preserves_tail_and_identical_records() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("logs");
+    let mut sink = RotatingLogFile::create_private(&path, "service", limits()).unwrap();
+    let directory = crate::fs_safety::PrivateDirectory::open_existing(&path).unwrap();
+    for id in ["a", "b", "c"] {
+        sink.write(&record(id)).unwrap();
+    }
+    let result = crate::cli::query_windows_rotating_logs(
+        &gate_args(2),
+        "service",
+        &directory,
+        |n| gate_read(&directory, n),
+        |bytes| {
+            let guard = rotation_guard(&sink.read_gate, Duration::ZERO).unwrap();
+            drop(guard); // Must already be unlocked while decoding.
+            gate_decode(bytes)
+        },
+    )
+    .unwrap();
+    assert_eq!(gate_ids(&result), ["b", "c"]);
+    let repeated = record("same");
+    sink.write(&repeated).unwrap();
+    sink.write(&repeated).unwrap();
+    let duplicate = gate_query(&directory, &gate_args(2));
+    assert_eq!(gate_ids(&duplicate), ["same", "same"]);
+    let rows = duplicate["entries"].as_array().unwrap();
+    assert!(rows[0]["cursor"].as_str().unwrap().ends_with(":1"));
+    assert!(rows[1]["cursor"].as_str().unwrap().ends_with(":2"));
+}
+
+#[test]
+fn reader_gate_contention_is_bounded_and_release_restores_reads() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("logs");
+    let mut sink = RotatingLogFile::create_private(&path, "service", limits()).unwrap();
+    sink.write(&record("a")).unwrap();
+    let directory = crate::fs_safety::PrivateDirectory::open_existing(&path).unwrap();
+    let first = RotatingLogFile::acquire_read_guard(&directory, "service").unwrap();
+    let second = RotatingLogFile::acquire_read_guard(&directory, "service").unwrap();
+    assert!(matches!(
+        rotation_guard(&sink.read_gate, Duration::ZERO),
+        Err(LogError::ReaderBusy)
+    ));
+    drop(first);
+    assert!(rotation_guard(&sink.read_gate, Duration::ZERO).is_err());
+    drop(second);
+    let exclusive = rotation_guard(&sink.read_gate, Duration::ZERO).unwrap();
+    let error = crate::cli::query_windows_rotating_logs(
+        &gate_args(10),
+        "service",
+        &directory,
+        |_| panic!("busy gate must not read payload"),
+        gate_decode,
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "log_snapshot_busy");
+    drop(exclusive);
+    assert_eq!(gate_ids(&gate_query(&directory, &gate_args(10))), ["a"]);
+    sink.write(&record("b")).unwrap();
+}
+
+#[test]
+fn reader_gate_is_existing_only_and_old_namespace_rejects_its_name() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("logs");
+    let sink = RotatingLogFile::create_private(&path, "service", limits()).unwrap();
+    drop(sink);
+    let gate = path.join(".service.jsonl.read.lock");
+    std::fs::remove_file(&gate).unwrap();
+    let directory = crate::fs_safety::PrivateDirectory::open_existing(&path).unwrap();
+    assert!(RotatingLogFile::acquire_read_guard(&directory, "service").is_err());
+    assert!(!gate.exists());
+    // Exact pre-protocol namespace parsing rejects this filename: neither active,
+    // the writer lease, nor an unpadded archive matches it.
+    let old_active = "service.jsonl";
+    let name = ".service.jsonl.read.lock";
+    assert_ne!(name, old_active);
+    assert_ne!(name, format!(".{old_active}.writer.lock"));
+    assert!(
+        name.strip_prefix(&format!("{old_active}."))
+            .and_then(|n| n.parse::<u8>().ok())
+            .is_none()
+    );
+    let mut reopened = RotatingLogFile::open(&path, "service", limits()).unwrap();
+    assert!(gate.exists());
+    reopened.write(&record("reopened")).unwrap();
+}
+
+#[test]
+fn reader_gate_timeout_does_not_latch_writer_and_retry_preserves_record() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("logs");
+    let mut sink = RotatingLogFile::create_private(&path, "service", limits()).unwrap();
+    let a = record("a")
+        .with_attribute("padding", "x".repeat(9000))
+        .unwrap();
+    let b = record("b")
+        .with_attribute("padding", "x".repeat(9000))
+        .unwrap();
+    sink.write(&a).unwrap();
+    let directory = crate::fs_safety::PrivateDirectory::open_existing(&path).unwrap();
+    let guard = RotatingLogFile::acquire_read_guard(&directory, "service").unwrap();
+    let before = std::fs::read(path.join("service.jsonl")).unwrap();
+    assert!(matches!(sink.write(&b), Err(LogError::ReaderBusy)));
+    assert!(!sink.failed);
+    assert_eq!(std::fs::read(path.join("service.jsonl")).unwrap(), before);
+    assert!(!path.join("service.jsonl.1").exists());
+    drop(guard);
+    sink.write(&b).unwrap();
+    assert_eq!(
+        gate_ids(&gate_query(&directory, &gate_args(10))),
+        ["a", "b"]
+    );
+}
+
+#[test]
+fn reader_gate_capture_error_releases_and_old_writer_cannot_create_gate() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("logs");
+    let mut sink = RotatingLogFile::create_private(&path, "service", limits()).unwrap();
+    let directory = crate::fs_safety::PrivateDirectory::open_existing(&path).unwrap();
+    let error = crate::cli::query_windows_rotating_logs(
+        &gate_args(10),
+        "service",
+        &directory,
+        |_| Err(crate::cli::fail(8, "fixture_read_error")),
+        gate_decode,
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "fixture_read_error");
+    let rotation = rotation_guard(&sink.read_gate, Duration::ZERO).unwrap();
+    drop(rotation);
+    sink.write(&record("still-healthy")).unwrap();
+    drop(sink);
+    let gate = path.join(".service.jsonl.read.lock");
+    std::fs::remove_file(&gate).unwrap();
+    let old_writer = private_file(
+        &path.join(".service.jsonl.writer.lock"),
+        &WindowsLogAccess::current_process().unwrap(),
+    )
+    .unwrap();
+    old_writer.try_lock().unwrap();
+    assert!(RotatingLogFile::open(&path, "service", limits()).is_err());
+    assert!(!gate.exists());
+    assert!(RotatingLogFile::acquire_read_guard(&directory, "service").is_err());
+    assert!(!gate.exists());
+}
+
+#[test]
+fn reader_gate_crash_child() {
+    let Some(path) = std::env::var_os("XCSC_READER_GATE_CHILD") else {
+        return;
+    };
+    let directory = crate::fs_safety::PrivateDirectory::open_existing(path).unwrap();
+    let _guard = RotatingLogFile::acquire_read_guard(&directory, "service").unwrap();
+    println!("READER_GATE_CHILD_LOCKED");
+    std::io::stdout().flush().unwrap();
+    loop {
+        std::thread::park();
+    }
+}
+#[test]
+fn reader_gate_process_death_releases_os_lock() {
+    use std::io::BufRead;
+    use std::process::{Command, Stdio};
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("logs");
+    let mut sink = RotatingLogFile::create_private(&path, "service", limits()).unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("log::windows_rotating::tests::reader_gate_crash_child")
+        .arg("--nocapture")
+        .env("XCSC_READER_GATE_CHILD", &path)
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+    loop {
+        let mut line = String::new();
+        assert_ne!(
+            output.read_line(&mut line).unwrap(),
+            0,
+            "child did not acquire gate"
+        );
+        if line.contains("READER_GATE_CHILD_LOCKED") {
+            break;
+        }
+    }
+    assert!(matches!(
+        rotation_guard(&sink.read_gate, Duration::ZERO),
+        Err(LogError::ReaderBusy)
+    ));
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let guard = rotation_guard(&sink.read_gate, Duration::ZERO).unwrap();
+    drop(guard);
+    sink.write(&record("healthy-after-reader-death")).unwrap();
 }
