@@ -49,7 +49,7 @@ xcsc 的 Rust 部分只有根目录一个包 `xcsc`、一个 `Cargo.toml` 和一
 | `tracing` | `XcscStructuredLayer` | 客户端 tracing 事件产生客户端 scope；日志输出器失败仍可观察 |
 | `offline-maintenance` | Linux 的 `state_file`、SQLite 和所需原生 SQLite 依赖 | 非 Linux target 不编译这两个模块，也不引入 target-specific SQLite 依赖；xssc 使用此功能开关 |
 
-产品固定 `package=xcsc`、精确 `=1.0.0` 和正式发布的完整官方 Git revision，
+产品固定 `package=xcsc`、精确 `=1.0.1` 和正式发布的完整官方 Git revision，
 通过 `xcsc::<module>` 导入。消费清单 `xcsc-client.toml` 使用 `desktop-client`、
 `mobile-client` 或 `offline-maintenance` 能力配置。根门禁拒绝子 Cargo 包、
 工作区外壳；消费门禁核对所有 manifest、别名、target、patch/replace
