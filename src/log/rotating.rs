@@ -20,6 +20,7 @@ pub struct RotatingLogFile {
     file: File,
     _writer: File,
     bytes: u64,
+    rotation_pending: bool,
     retention: LogRetention,
 }
 
@@ -98,7 +99,7 @@ impl RotatingLogFile {
         // Otherwise open("events") and open_file("events.jsonl") could each
         // hold a different lock while appending to the same active file.
         let writer_path = path.join(format!(".{active_name}.writer.lock"));
-        let writer = open_private(&writer_path)?;
+        let writer = open_private(&writer_path, false)?;
         flock(&writer, FlockOperation::NonBlockingLockExclusive)
             .map_err(|_| LogError::UnsafeStorage)?;
         verify_named(&writer_path, &writer)?;
@@ -125,7 +126,7 @@ impl RotatingLogFile {
             }
         }
         let active_path = path.join(active_name);
-        let file = open_private(&active_path)?;
+        let file = open_private(&active_path, false)?;
         let bytes = file.metadata()?.len();
         if bytes > retention.file_bytes {
             return Err(LogError::InvalidLimits);
@@ -139,6 +140,7 @@ impl RotatingLogFile {
             file,
             _writer: writer,
             bytes,
+            rotation_pending: false,
             retention,
         };
         sink.verify_directory()?;
@@ -155,11 +157,14 @@ impl RotatingLogFile {
     pub fn write(&mut self, record: &LogRecord) -> Result<(), LogError> {
         let line = record.json_line()?;
         self.verify_directory()?;
-        verify_named(&self.active_path(), &self.file)?;
         verify_named(
             &self.path.join(format!(".{}.writer.lock", self.active_name)),
             &self._writer,
         )?;
+        if self.rotation_pending {
+            self.finish_rotation()?;
+        }
+        verify_named(&self.active_path(), &self.file)?;
         if self.file.metadata()?.len() != self.bytes {
             return Err(LogError::UnsafeStorage);
         }
@@ -170,7 +175,12 @@ impl RotatingLogFile {
         {
             self.rotate()?;
         }
-        self.file.write_all(&line)?;
+        if let Err(error) = self.file.write_all(&line) {
+            // A failed append may leave a prefix. Discard only this attempt;
+            // a failed rollback keeps the existing length check fail-closed.
+            self.file.set_len(self.bytes)?;
+            return Err(error.into());
+        }
         self.file.flush()?;
         self.bytes += line.len() as u64;
         Ok(())
@@ -189,11 +199,22 @@ impl RotatingLogFile {
         }
         verify_named(&self.active_path(), &self.file)?;
         fs::rename(self.active_path(), self.archive_path(1))?;
-        self.file = open_private(&self.active_path())?;
+        self.rotation_pending = true;
+        self.finish_rotation()
+    }
+
+    fn finish_rotation(&mut self) -> Result<(), LogError> {
+        // Retain the archived handle until replacement creation succeeds.
+        verify_named(&self.archive_path(1), &self.file)?;
+        if self.file.metadata()?.len() != self.bytes {
+            return Err(LogError::UnsafeStorage);
+        }
+        self.file = open_private(&self.active_path(), true)?;
         if self.file.metadata()?.len() != 0 {
             return Err(LogError::UnsafeStorage);
         }
         self.bytes = 0;
+        self.rotation_pending = false;
         self.directory.sync_all()?;
         Ok(())
     }
@@ -234,11 +255,12 @@ impl RotatingLogFile {
     }
 }
 
-fn open_private(path: &Path) -> Result<File, LogError> {
+fn open_private(path: &Path, create_new: bool) -> Result<File, LogError> {
     let file = OpenOptions::new()
         .read(true)
         .append(true)
         .create(true)
+        .create_new(create_new)
         .mode(0o600)
         .custom_flags((OFlags::NOFOLLOW | OFlags::NONBLOCK).bits() as i32)
         .open(path)?;
@@ -265,5 +287,140 @@ fn verify_named(path: &Path, file: &File) -> Result<(), LogError> {
         Err(LogError::UnsafeStorage)
     } else {
         Ok(())
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod recovery_tests {
+    use super::*;
+    use crate::log::{CommonEvent, LogFilter, QueryLimits, query};
+    use std::{os::unix::fs::PermissionsExt, process::Command};
+
+    // Resource-limit failures are confined to a subprocess, never the parallel
+    // test runner. All files belong to that subprocess's temporary directory.
+    fn in_child() -> bool {
+        let name = std::thread::current().name().unwrap().to_owned();
+        if std::env::var("LOG_RECOVERY_TEST").as_deref() == Ok(&name) {
+            return true;
+        }
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--nocapture"])
+            .env("LOG_RECOVERY_TEST", &name)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        false
+    }
+
+    #[allow(unsafe_code)]
+    fn limited<T>(resource: libc::__rlimit_resource_t, bytes: u64, f: impl FnOnce() -> T) -> T {
+        // SAFETY: this is an isolated child process; valid rlimit pointers, and
+        // the original limits and signal disposition are restored after f.
+        unsafe {
+            let mut old = std::mem::zeroed::<libc::rlimit>();
+            assert_eq!(libc::getrlimit(resource, &mut old), 0);
+            let handler = libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            let new = libc::rlimit {
+                rlim_cur: bytes,
+                ..old
+            };
+            assert_eq!(libc::setrlimit(resource, &new), 0);
+            let result = f();
+            assert_eq!(libc::setrlimit(resource, &old), 0);
+            libc::signal(libc::SIGXFSZ, handler);
+            result
+        }
+    }
+
+    fn fixture() -> (tempfile::TempDir, RotatingLogFile, LogRecord) {
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let sink = RotatingLogFile::open(
+            directory.path(),
+            "events",
+            LogRetention {
+                file_bytes: MAX_RECORD_BYTES as u64,
+                archives: 2,
+            },
+        )
+        .unwrap();
+        let record = LogRecord::common("example", CommonEvent::RuntimeStarted).unwrap();
+        (directory, sink, record)
+    }
+
+    #[test]
+    fn partial_append_rolls_back_and_later_records_remain_queryable() {
+        if !in_child() {
+            return;
+        }
+        let (directory, mut sink, record) = fixture();
+        let active = directory.path().join("events.jsonl");
+        sink.write(&record).unwrap();
+        let before = fs::read(&active).unwrap();
+        let error = limited(libc::RLIMIT_FSIZE, before.len() as u64 + 17, || {
+            sink.write(&record)
+        });
+        assert!(matches!(error, Err(LogError::Io(_))));
+        assert_eq!(fs::read(&active).unwrap(), before);
+        sink.write(&record).unwrap();
+        let bytes = fs::read(&active).unwrap();
+        assert_eq!(
+            query(&bytes[..], LogFilter::default(), QueryLimits::default())
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn failed_replacement_creation_retries_without_rotating_archives_twice() {
+        if !in_child() {
+            return;
+        }
+        let (directory, mut sink, record) = fixture();
+        let active = directory.path().join("events.jsonl");
+        let line = record.json_line().unwrap();
+        while fs::metadata(&active).unwrap().len() + line.len() as u64 <= MAX_RECORD_BYTES as u64 {
+            sink.write(&record).unwrap();
+        }
+        let before = fs::read(&active).unwrap();
+        let error = limited(libc::RLIMIT_NOFILE, 0, || sink.write(&record));
+        assert!(matches!(error, Err(LogError::Io(_))));
+        assert!(!active.exists());
+        let archived = directory.path().join("events.1.jsonl");
+        assert_eq!(fs::read(&archived).unwrap(), before);
+        sink.write(&record).unwrap();
+        assert_eq!(fs::read(&archived).unwrap(), before);
+        assert_eq!(fs::read(&active).unwrap(), line);
+        assert!(!directory.path().join("events.2.jsonl").exists());
+        let padded = record.with_attribute("padding", "x".repeat(4096)).unwrap();
+        for _ in 0..30 {
+            sink.write(&padded).unwrap();
+        }
+        for name in ["events.jsonl", "events.1.jsonl", "events.2.jsonl"] {
+            let bytes = fs::read(directory.path().join(name)).unwrap();
+            assert!(bytes.len() <= MAX_RECORD_BYTES);
+            assert!(
+                !query(&bytes[..], LogFilter::default(), QueryLimits::default())
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn unexpected_length_change_is_still_rejected_without_truncation() {
+        let (directory, mut sink, record) = fixture();
+        sink.write(&record).unwrap();
+        let active = directory.path().join("events.jsonl");
+        OpenOptions::new()
+            .append(true)
+            .open(&active)
+            .unwrap()
+            .write_all(b"external")
+            .unwrap();
+        let before = fs::read(&active).unwrap();
+        assert!(matches!(sink.write(&record), Err(LogError::UnsafeStorage)));
+        assert_eq!(fs::read(&active).unwrap(), before);
     }
 }
