@@ -53,6 +53,45 @@ mod macos {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    #[test]
+    fn logs_since_reads_product_jsonl_from_the_service_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("service.log");
+        let record =
+            crate::log::LogRecord::common("example", crate::log::CommonEvent::RuntimeStarted)
+                .unwrap();
+        let mut record = serde_json::to_value(record).unwrap();
+        let mut bytes = Vec::new();
+        for timestamp in ["2026-10-11T23:59:59.999Z", "2026-10-12T00:00:00.000Z"] {
+            record["timestamp"] = json!(timestamp);
+            serde_json::to_writer(&mut bytes, &record).unwrap();
+            bytes.push(b'\n');
+        }
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut service = fixture_service();
+        service.log_path = Box::leak(path.to_str().unwrap().to_owned().into_boxed_str());
+        let args = Args::parse(
+            vec![
+                "logs".into(),
+                "--since".into(),
+                "2026-10-12T00:00:00Z".into(),
+            ],
+            &[],
+            &[],
+        )
+        .unwrap();
+        let result = service.logs(&args).unwrap();
+        let entries = result["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(
+            entries[0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("2026-10-12T00:00:00.000Z")
+        );
+    }
+
     struct Agent {
         directory: tempfile::TempDir,
         domain: String,
@@ -188,4 +227,40 @@ mod macos {
             .unwrap();
         assert_eq!(agent.print().status.code(), Some(113));
     }
+}
+
+#[test]
+fn service_log_since_includes_structured_records_at_the_utc_boundary() {
+    let record =
+        crate::log::LogRecord::common("example", crate::log::CommonEvent::RuntimeStarted).unwrap();
+    let mut value = serde_json::to_value(record).unwrap();
+    value["timestamp"] = json!("2026-10-12T08:00:00.123Z");
+    let line = serde_json::to_string(&value).unwrap();
+    assert!(service_log_matches_since(&line, "2026-10-12T08:00:00Z"));
+    assert!(service_log_matches_since(&line, "2026-10-12T08:00:00.123Z"));
+    assert!(!service_log_matches_since(&line, "2026-10-12T08:00:01Z"));
+    assert!(service_log_matches_since(&line, "2026-10-12"));
+    assert!(service_log_matches_since(
+        "2026-10-12T08:00:01Z service started",
+        "2026-10-12T08:00:00Z",
+    ));
+    assert!(!service_log_matches_since("no timestamp", "2026-10-12"));
+}
+
+#[test]
+fn service_log_since_uses_only_timestamp_and_compares_utc_days() {
+    let before = r#"{"timestamp":"2026-10-11T23:59:59.999Z","message":"2026-10-13T00:00:00Z"}"#;
+    let boundary = r#"{"timestamp":"2026-10-12T00:00:00.000Z"}"#;
+    assert!(!service_log_matches_since(before, "2026-10-12"));
+    assert!(service_log_matches_since(boundary, "2026-10-12"));
+    assert!(service_log_matches_since(boundary, "2026-10-12T00:00:00Z"));
+    assert!(service_log_matches_since(boundary, "2026-10-12 00:00:00"));
+    assert!(!service_log_matches_since(
+        r#"{"message":"2026-10-13T00:00:00Z"}"#,
+        "2026-10-12",
+    ));
+    assert!(!service_log_matches_since(
+        r#"{"timestamp":null,"message":"2026-10-13T00:00:00Z"}"#,
+        "2026-10-12",
+    ));
 }

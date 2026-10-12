@@ -29,6 +29,30 @@ fn command_failure(exit: u8, code: &'static str, output: &std::process::Output) 
     };
     fail(exit, code).with_detail(detail)
 }
+#[cfg(any(target_os = "macos", test))]
+fn service_log_matches_since(line: &str, since: &str) -> bool {
+    if let Ok(value) = serde_json::from_str::<Value>(line) {
+        // Product runtime records arrive here as JSONL via launchd stderr.
+        // Only their timestamp is authoritative, never a date in the message.
+        let Some(timestamp) = value["timestamp"].as_str() else {
+            return false;
+        };
+        let Ok(observed) = chrono::DateTime::parse_from_rfc3339(timestamp) else {
+            return false;
+        };
+        let boundary = chrono::DateTime::parse_from_rfc3339(since)
+            .map(|time| time.naive_utc())
+            .or_else(|_| chrono::NaiveDateTime::parse_from_str(since, "%Y-%m-%dT%H:%M:%S%.f"))
+            .or_else(|_| chrono::NaiveDateTime::parse_from_str(since, "%Y-%m-%d %H:%M:%S%.f"))
+            .or_else(|_| {
+                chrono::NaiveDate::parse_from_str(since, "%Y-%m-%d")
+                    .map(|date| date.and_hms_opt(0, 0, 0).unwrap())
+            });
+        return boundary.is_ok_and(|boundary| observed.naive_utc() >= boundary);
+    }
+    line.chars().next().is_some_and(|c| c.is_ascii_digit()) && line >= since
+}
+
 pub struct Service {
     #[cfg(not(target_os = "macos"))]
     pub name: &'static str,
@@ -541,9 +565,7 @@ impl Service {
                 {
                     return Err(fail(2, "invalid_log_since"));
                 }
-                lines.retain(|line| {
-                    line.chars().next().is_some_and(|c| c.is_ascii_digit()) && *line >= since
-                });
+                lines.retain(|line| service_log_matches_since(line, since));
             }
             let skip = lines.len().saturating_sub(tail);
             let entries: Vec<_> = lines
