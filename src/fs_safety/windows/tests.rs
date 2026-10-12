@@ -1,4 +1,5 @@
 use super::*;
+use windows_sys::Win32::System::IO::OVERLAPPED;
 
 #[test]
 fn process_user_sid_matches_the_native_primary_token_identity() {
@@ -63,6 +64,99 @@ fn held_private_file_keeps_original_pins_after_directory_owner_drops() {
     held.verify().unwrap();
     drop(held);
     std::fs::rename(&path, temp.path().join("moved")).unwrap();
+}
+
+fn lock_first_byte(file: &File) -> OVERLAPPED {
+    // SAFETY: a zeroed OVERLAPPED denotes byte offset zero and no event. The
+    // synchronous handle and structure remain live through the native call.
+    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    assert_ne!(
+        unsafe {
+            LockFileEx(
+                file.as_raw_handle(),
+                LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                0,
+                1,
+                0,
+                &mut overlapped,
+            )
+        },
+        0,
+        "{}",
+        std::io::Error::last_os_error()
+    );
+    overlapped
+}
+
+fn unlock_first_byte(file: &File, mut overlapped: OVERLAPPED) {
+    // SAFETY: this is the same live handle and byte range successfully locked
+    // above; the structure remains live for the synchronous native call.
+    assert_ne!(
+        unsafe { UnlockFileEx(file.as_raw_handle(), 0, 1, 0, &mut overlapped) },
+        0,
+        "{}",
+        std::io::Error::last_os_error()
+    );
+}
+
+#[test]
+fn held_private_file_verifies_zero_length_under_real_byte_range_lock() {
+    let temp = tempfile::tempdir().unwrap();
+    let directory = PrivateDirectory::create(temp.path().join("private-lock")).unwrap();
+    let name = EntryName::new(".xsoc.jsonl.writer.lock").unwrap();
+    super::super::AtomicFile::create(&directory, &name, b"").unwrap();
+    let writer = directory
+        .open_private_file(&name, PrivateFileAccess::ReadWrite)
+        .unwrap();
+    // Windows permits locking past EOF. A second handle in the same process
+    // must not read the locked byte, even though this file has length zero.
+    let overlapped = lock_first_byte(writer.file());
+    let inspector = directory
+        .open_private_file(&name, PrivateFileAccess::ReadOnly)
+        .unwrap();
+    assert_eq!(inspector.file().metadata().unwrap().len(), 0);
+    inspector.verify().unwrap();
+    assert!(matches!(
+        directory.read_private_bounded(&name, 64),
+        Err(Error::Io(error)) if error.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32)
+    ));
+    inspector.verify().unwrap();
+    unlock_first_byte(writer.file(), overlapped);
+    assert_eq!(directory.read_private_bounded(&name, 64).unwrap(), b"");
+}
+
+#[test]
+fn held_private_file_rejects_acl_poison_while_zero_length_byte_is_locked() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("private-lock");
+    let directory = PrivateDirectory::create(&path).unwrap();
+    let name = EntryName::new(".xsoc.jsonl.read.lock").unwrap();
+    super::super::AtomicFile::create(&directory, &name, b"").unwrap();
+    let writer = directory
+        .open_private_file(&name, PrivateFileAccess::ReadWrite)
+        .unwrap();
+    let overlapped = lock_first_byte(writer.file());
+    let inspector = directory
+        .open_private_file(&name, PrivateFileAccess::ReadOnly)
+        .unwrap();
+    let poisoned = OpenOptions::new()
+        .access_mode(READ_CONTROL | WRITE_DAC)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(path.join(name.as_path()))
+        .unwrap();
+    unsafe_acl(&poisoned);
+    let before = physical_acl_text(&poisoned);
+    assert_eq!(inspector.file().metadata().unwrap().len(), 0);
+    assert!(matches!(
+        inspector.verify(),
+        Err(Error::UnsafePermissions(_))
+    ));
+    assert!(matches!(
+        directory.open_private_file(&name, PrivateFileAccess::ReadOnly),
+        Err(Error::UnsafePermissions(_))
+    ));
+    assert_eq!(physical_acl_text(&poisoned), before);
+    unlock_first_byte(writer.file(), overlapped);
 }
 
 #[test]
