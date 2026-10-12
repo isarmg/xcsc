@@ -14,7 +14,11 @@ fn fixture_service() -> Service {
 #[test]
 fn native_service_calendar_clock_uses_utc_in_the_child() {
     let output = fixture_service()
-        .capture("/bin/sh", &["-c", "printf '%s' \"$TZ\""], Duration::from_secs(2))
+        .capture(
+            "/bin/sh",
+            &["-c", "printf '%s' \"$TZ\""],
+            Duration::from_secs(2),
+        )
         .unwrap();
     assert!(output.status.success());
     assert_eq!(output.stdout, b"UTC0");
