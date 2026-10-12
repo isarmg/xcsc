@@ -16,11 +16,11 @@ xcsc 是桌面、移动和离线客户端的 Rust 公共基础库。各产品通
 
 ## 快速部署
 
-本项目是编译链接进产品的库，无需单独安装或启动服务。在产品 `Cargo.toml` 中加入固定依赖：
+本项目是编译链接进产品的库，无需单独安装或启动服务。本地已准备 1.0.4，正式发行后在产品 `Cargo.toml` 中加入固定依赖：
 
 ```toml
 [dependencies]
-xcsc = { git = "https://github.com/isarmg/xcsc.git", rev = "5641a33e991209eecdbbc91cffaa3be545875757", version = "=1.0.3" }
+xcsc = { git = "https://github.com/isarmg/xcsc.git", rev = "<v1.0.4 对应的完整 40 位 Git 修订>", version = "=1.0.4" }
 ```
 
 默认功能适用于桌面接入；移动导出启用 `mobile-ffi`，Android JNI 启用 `jni`，Linux 离线维护启用 `offline-maintenance`。产品根目录声明 `xcsc-client.toml`，选择对应能力配置并提交 `Cargo.lock`；随后构建、安装该产品。
