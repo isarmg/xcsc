@@ -29,7 +29,7 @@ fn command_failure(exit: u8, code: &'static str, output: &std::process::Output) 
     };
     fail(exit, code).with_detail(detail)
 }
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 fn service_log_matches_since(line: &str, since: &str) -> bool {
     if let Ok(value) = serde_json::from_str::<Value>(line) {
         // Product runtime records arrive here as JSONL via launchd stderr.
