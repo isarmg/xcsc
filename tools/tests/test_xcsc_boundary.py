@@ -40,20 +40,16 @@ class XcscBoundaryTests(unittest.TestCase):
         self.assertIn("mobile_ffi", result["modules"])
         self.assertIn("log", result["modules"])
 
-    def test_root_dependency_overrides_cannot_import_product_packages(self) -> None:
-        cargo = self.root / "Cargo.toml"
-        original = cargo.read_text()
-        for section in [
-            f'[patch.crates-io]\nproduct = {{ package = "{package}", version = "0.1" }}'
-            for package in ("xcsc-product",)
-        ] + [
-            f'[replace]\n"{package}:0.1.0" = {{ version = "=1.0.0" }}'
-            for package in ("xcsc-product",)
-        ]:
-            with self.subTest(section=section):
-                cargo.write_text(original + "\n" + section + "\n")
-                with self.assertRaisesRegex(ConformanceError, "outside client platform"):
-                    CHECKER.check()
+    def test_dependency_ownership_uses_real_structure_not_name_prefix(self) -> None:
+        CHECKER.check_dependencies({"dependencies": {"xcsc-independent-codec": "1.0.0"}})
+        for table in ("patch", "replace"):
+            cargo = self.root / "Cargo.toml"
+            original = cargo.read_text()
+            extra = ('[patch.crates-io]\ncodec={package="unrelated-name",path="../product"}\n' if table == "patch" else '[replace]\n"unrelated-name:1.0.0"={path="../product"}\n')
+            cargo.write_text(original + '\n' + extra)
+            with self.assertRaisesRegex(ConformanceError, "forbids workspace or path"):
+                CHECKER.check()
+            cargo.write_text(original)
 
     def test_a_workspace_facade_cannot_restore_split_packages(self) -> None:
         cargo = self.root / "Cargo.toml"

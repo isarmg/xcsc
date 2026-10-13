@@ -104,7 +104,7 @@ class ClientPolicyTests(unittest.TestCase):
                         verify_source(product, ROOT)
 
 
-    def test_resolved_graph_rejects_split_and_mismatched_client_sources(self) -> None:
+    def test_resolved_graph_checks_actual_source_without_prefix_inference(self) -> None:
         component = '\n[[components]]\nid="offline"\nprofile="offline-maintenance"\ncapabilities=["private-state", "explicit-paths", "restore-journal", "linux-openat2", "offline-sqlite-maintenance"]\n'
         with tempfile.TemporaryDirectory() as directory:
             product = Path(directory)
@@ -115,11 +115,11 @@ class ClientPolicyTests(unittest.TestCase):
             self.write_lock(product)
             verify_source(product, ROOT)
             original = (product / "Cargo.lock").read_text()
-            for package in ('xcsc-runtime',):
-                with self.subTest(package=package):
-                    (product / "Cargo.lock").write_text(original + f'[[package]]\nname="{package}"\nversion="1.0.0"\n')
-                    with self.assertRaises(ConformanceError):
-                        verify_source(product, ROOT)
+            (product / "Cargo.lock").write_text(original + '[[package]]\nname="xcsc-independent-codec"\nversion="1.0.0"\nsource="registry+https://github.com/rust-lang/crates.io-index"\n')
+            verify_source(product, ROOT)
+            (product / "Cargo.lock").write_text(original + '[[package]]\nname="unrelated-name"\nversion="1.0.0"\nsource="git+https://github.com/isarmg/xcsc.git?rev=' + 'a' * 40 + '#' + 'a' * 40 + '"\n')
+            with self.assertRaisesRegex(ConformanceError, "official xcsc source resolves an additional"):
+                verify_source(product, ROOT)
             self.write_lock(product, "b" * 40)
             with self.assertRaisesRegex(ConformanceError, "resolved xcsc differs"):
                 verify_source(product, ROOT)

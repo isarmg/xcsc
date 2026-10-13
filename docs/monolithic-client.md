@@ -20,15 +20,15 @@ xcsc 的 Rust 部分只有根目录一个包 `xcsc`、一个 `Cargo.toml` 和一
 | `xcsc::state_file` | Linux 离线客户端对现有服务私有目录和维护锁的受控操作 |
 | `xcsc::sqlite` | Linux 离线客户端的直接 SQLite 连接、原生预算、防御模式与当前数据库结构验证；没有 pool、服务端生命周期或业务迁移 |
 
-`state_file` 使用中立文件名 `.state-instance.lock`、`.state-maintenance.lock`
-和 `.state-maintenance-pending.json`，校验当前元数据及精确结构指纹。
-这些名称描述当前格式。具体升级定义、恢复日志、服务停止
+`state_file` 使用中立文件名 `.state-instance.lock`、`.state-maintenance.lock`，
+分别提供独立的实例互斥与工具管理互斥，不读取维护 pending 标记或控制 Server 启动。
+`sqlite` 校验当前元数据及精确结构指纹。具体升级定义、恢复日志、服务停止
 策略与业务 SQL 由 xssc 拥有，操作前阅读该工具的实际升级说明。客户端自身日志用 `LogRecord::client` 和 `scope=client`；离线查询仍能读取
 既有 `scope=server` 记录并保持其身份。
 
 维护及实例 flock 在取得后立即由私有 RAII guard 持有，后续身份检查失败和
 隐式 Drop 都先解锁该打开文件描述，再关闭描述符，避免并行进程
-短暂继承同一描述符时阻塞恢复。显式交接成功后取消 guard 的解锁责任，保证
+短暂继承同一描述符时阻塞恢复。显式释放成功后取消 guard 的解锁责任，保证
 旧 guard 的销毁不会解开别名后来重新获得的锁。清理不重新打开、删除或
 修复路径；锁文件的 inode、属主与权限校验不变。
 

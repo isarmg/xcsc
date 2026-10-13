@@ -1,0 +1,12 @@
+{
+  "provenance": "Independent Python cryptography HKDF-SHA256 and AESGCM; public non-secret test master and nonce",
+  "domain_hex": "746573742f63726564656e7469616c",
+  "revision": 1,
+  "binding_hex": "6f626a6563742d31",
+  "master_hex": "0909090909090909090909090909090909090909090909090909090909090909",
+  "nonce_hex": "000102030405060708090a0b",
+  "plaintext_hex": "736563726574",
+  "derived_key_hex": "1ad2780b8ea1dffde4edad0c5c756e0948923479c6d9beab0be57deea86f67eb",
+  "aad_hex": "000f746573742f63726564656e7469616c0001000000086f626a6563742d31",
+  "envelope_hex": "534745560001000102030405060708090a0b9b37bce19cdb9c13cc3e16b2673cea12af368204f84d"
+}

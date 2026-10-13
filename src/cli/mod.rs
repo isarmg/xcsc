@@ -111,7 +111,7 @@ impl Args {
     /// Product option names deliberately stay out of xcsc: a product
     /// supplies only its valued and boolean option declarations. Product
     /// adapters validate the meaning of those values, including path policies,
-    /// before dispatching commands. Common config/state paths are absolute.
+    /// before dispatching commands. The common config path is absolute.
     pub fn parse(
         raw: Vec<String>,
         valued_product_options: &[&str],
@@ -123,14 +123,13 @@ impl Args {
         while let Some(arg) = it.next() {
             if arg.starts_with('-') {
                 let name = match arg.as_str() {
-                    "--output" => "--format",
                     "-h" => "--help",
                     "-V" => "--version",
                     _ => &arg,
                 }
                 .to_string();
                 let value = match name.as_str() {
-                    "--format" | "--timeout" | "--config" | "--state" | "--tail" | "--since"
+                    "--format" | "--timeout" | "--config" | "--tail" | "--since"
                     | "--instance-id" | "--event" | "--request-id" | "--task-id" | "--level" => {
                         it.next().ok_or_else(|| fail(2, "missing_option_value"))?
                     }
@@ -146,12 +145,6 @@ impl Args {
                     | "--version"
                     | "--installer-session"
                     | "--elevated-setup-child" => "true".into(),
-                    "--json" => {
-                        if options.insert("--format".into(), "json".into()).is_some() {
-                            return Err(fail(2, "duplicate_option"));
-                        }
-                        continue;
-                    }
                     option if valued_product_options.contains(&option) => {
                         it.next().ok_or_else(|| fail(2, "missing_option_value"))?
                     }
@@ -180,10 +173,8 @@ impl Args {
                 .map(String::as_str)
                 .unwrap_or("60s"),
         )?;
-        for name in ["--config", "--state"] {
-            if let Some(value) = options.get(name) {
-                absolute(Path::new(value))?;
-            }
+        if let Some(value) = options.get("--config") {
+            absolute(Path::new(value))?;
         }
         Ok(Self {
             words,
@@ -208,7 +199,6 @@ impl Args {
                 "--format",
                 "--timeout",
                 "--config",
-                "--state",
                 "--non-interactive",
                 "--no-color",
                 "--help",
@@ -478,18 +468,15 @@ pub fn emit<C: ProductErrorCatalog + ?Sized>(
 }
 
 pub fn requested_error_format(raw: &[String]) -> &'static str {
-    if raw.iter().any(|argument| argument == "--json") {
-        return "json";
-    }
     raw.windows(2)
         .find_map(|pair| {
-            (["--format", "--output"].contains(&pair[0].as_str())
-                && ["json", "ndjson"].contains(&pair[1].as_str()))
-            .then_some(if pair[1] == "ndjson" {
-                "ndjson"
-            } else {
-                "json"
-            })
+            (pair[0] == "--format" && ["json", "ndjson"].contains(&pair[1].as_str())).then_some(
+                if pair[1] == "ndjson" {
+                    "ndjson"
+                } else {
+                    "json"
+                },
+            )
         })
         .unwrap_or("human")
 }
@@ -1120,12 +1107,17 @@ mod concise_error_tests {
                 "absolute_path_required"
             );
         }
-        for name in ["--config", "--state"] {
-            let error = Args::parse(vec![name.into(), "relative-path".into()], &[], &[])
+        let error = Args::parse(vec!["--config".into(), "relative-path".into()], &[], &[])
+            .err()
+            .expect("common paths must be absolute");
+        assert_eq!(error.code, "absolute_path_required");
+        assert_eq!(
+            Args::parse(vec!["--state".into(), "/tmp/unused".into()], &[], &[])
                 .err()
-                .expect("common paths must be absolute");
-            assert_eq!(error.code, "absolute_path_required");
-        }
+                .expect("retired option must be rejected")
+                .code,
+            "unknown_option"
+        );
     }
 
     #[test]
@@ -1339,7 +1331,20 @@ mod concise_error_tests {
             requested_error_format(&["--format".into(), "json".into(), "--bad".into()]),
             "json"
         );
-        assert_eq!(requested_error_format(&["--json".into()]), "json");
+        assert_eq!(requested_error_format(&["--json".into()]), "human");
+        assert_eq!(
+            requested_error_format(&["--output".into(), "json".into()]),
+            "human"
+        );
+        for retired in ["--json", "--output"] {
+            assert_eq!(
+                Args::parse(vec![retired.into(), "json".into()], &[], &[])
+                    .err()
+                    .expect("retired option must be rejected")
+                    .code,
+                "unknown_option"
+            );
+        }
     }
 
     #[cfg(windows)]

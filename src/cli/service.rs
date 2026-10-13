@@ -242,7 +242,7 @@ impl Service {
                 || registered.first() != Some(&expected_binary)
                 || registered.len() != 4
                 || registered[1] != "run"
-                || !["--config", "--state"].contains(&registered[2].as_str())
+                || registered[2] != "--config"
                 || registered[3] != self.default_config.to_string_lossy()
             {
                 return Err(fail(8, "service_registration_mismatch"));

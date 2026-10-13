@@ -160,8 +160,8 @@ def verify_client_lock(path: Path, version: str, revision: str | None = None) ->
     for package in packages:
         name = package.get("name", "")
         source = str(package.get("source", ""))
-        if name.startswith("xcsc-"):
-            raise ConformanceError(f"[client-source-identity] {path}: retired split client package {name}")
+        if (source.startswith("git+https://github.com/isarmg/xcsc.git?") or source.startswith("git+https://github.com/isarmg/xcsc.git#") or source == "git+https://github.com/isarmg/xcsc.git") and name != "xcsc":
+            raise ConformanceError(f"[client-source-identity] {path}: official xcsc source resolves an additional package {name}")
         if name == "xcsc":
             client_packages += 1
             expected = f"git+https://github.com/isarmg/xcsc.git?rev={revision}#{revision}"
@@ -387,8 +387,8 @@ def verify_source(product_root: Path, foundation_root: Path) -> dict[str, Any]:
             if isinstance(requirement, dict) and requirement.get("workspace") is True:
                 requirement = workspace.get(dependency, {})
             package = requirement.get("package", dependency) if isinstance(requirement, dict) else dependency
-            if package.startswith("xcsc-"):
-                findings.append(f"[client-source-identity] {path}: only the monolithic xcsc package may be consumed")
+            if isinstance(requirement, dict) and requirement.get("git") == "https://github.com/isarmg/xcsc.git" and package != "xcsc":
+                findings.append(f"[client-source-identity] {path}: official xcsc source declares an additional package {package}")
             if package == "xcsc":
                 if not (
                     isinstance(requirement, dict)

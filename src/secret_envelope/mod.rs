@@ -9,10 +9,17 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
-const MAGIC: &[u8; 4] = b"SGEV";
-const NONCE_BYTES: usize = 12;
-const MAX_PLAINTEXT_BYTES: usize = 1024 * 1024;
+pub const MAGIC: &[u8; 4] = b"SGEV";
+pub const NONCE_BYTES: usize = 12;
+pub const MAX_PLAINTEXT_BYTES: usize = 1024 * 1024;
 pub const MAX_BINDING_BYTES: usize = 4096;
+
+pub const MAX_DOMAIN_BYTES: usize = u16::MAX as usize;
+pub const HEADER_BYTES: usize = MAGIC.len() + size_of::<u16>();
+pub const TAG_BYTES: usize = 16;
+pub const MASTER_KEY_BYTES: usize = 32;
+pub const CURRENT_ENVELOPE_VALIDATION_VECTORS_JSON: &str =
+    include_str!("fixtures/current-envelope-v1.json");
 
 pub trait EnvelopeDomain {
     const DOMAIN: &'static [u8];
@@ -20,24 +27,30 @@ pub trait EnvelopeDomain {
 }
 
 pub fn seal<D: EnvelopeDomain>(
-    master: &SecretKey<32>,
+    master: &SecretKey<MASTER_KEY_BYTES>,
     binding: &[u8],
     plaintext: &SecretBytes,
 ) -> Result<Vec<u8>, Error> {
-    if D::DOMAIN.is_empty() || binding.is_empty() {
-        return Err(Error::MissingDomainBinding);
-    }
-    if binding.len() > MAX_BINDING_BYTES {
-        return Err(Error::BindingTooLarge);
-    }
+    seal_with_domain(master, D::DOMAIN, D::REVISION, binding, plaintext)
+}
+
+/// Seal the one current envelope using a verified caller-owned domain policy.
+pub fn seal_with_domain(
+    master: &SecretKey<MASTER_KEY_BYTES>,
+    domain: &[u8],
+    revision: u16,
+    binding: &[u8],
+    plaintext: &SecretBytes,
+) -> Result<Vec<u8>, Error> {
+    validate_domain_binding(domain, binding)?;
     if plaintext.expose().len() > MAX_PLAINTEXT_BYTES {
         return Err(Error::PlaintextTooLarge);
     }
-    let key = derive_key::<D>(master, binding)?;
+    let key = derive_key(master, domain, binding)?;
     let cipher = Aes256Gcm::new_from_slice(&key[..]).map_err(|_| Error::Crypto)?;
     let mut nonce = [0_u8; NONCE_BYTES];
     getrandom::fill(&mut nonce).map_err(|_| Error::Randomness)?;
-    let aad = aad::<D>(binding)?;
+    let aad = aad(domain, revision, binding)?;
     let ciphertext = cipher
         .encrypt(
             <&Nonce<aes_gcm::aead::consts::U12>>::try_from(&nonce[..])
@@ -48,42 +61,51 @@ pub fn seal<D: EnvelopeDomain>(
             },
         )
         .map_err(|_| Error::Crypto)?;
-    let mut output = Vec::with_capacity(6 + NONCE_BYTES + ciphertext.len());
+    let mut output = Vec::with_capacity(HEADER_BYTES + NONCE_BYTES + ciphertext.len());
     output.extend_from_slice(MAGIC);
-    output.extend_from_slice(&D::REVISION.to_be_bytes());
+    output.extend_from_slice(&revision.to_be_bytes());
     output.extend_from_slice(&nonce);
     output.extend_from_slice(&ciphertext);
     Ok(output)
 }
 
 pub fn open<D: EnvelopeDomain>(
-    master: &SecretKey<32>,
+    master: &SecretKey<MASTER_KEY_BYTES>,
     binding: &[u8],
     envelope: &[u8],
 ) -> Result<SecretBytes, Error> {
-    if D::DOMAIN.is_empty() || binding.is_empty() {
-        return Err(Error::MissingDomainBinding);
-    }
-    if binding.len() > MAX_BINDING_BYTES {
-        return Err(Error::BindingTooLarge);
-    }
-    if envelope.len() < 6 + NONCE_BYTES + 16
-        || envelope.len() > 6 + NONCE_BYTES + 16 + MAX_PLAINTEXT_BYTES
+    open_with_domain(master, D::DOMAIN, D::REVISION, binding, envelope)
+}
+
+/// Verify the exact current domain/revision obtained from trusted contract
+/// data. Never infer the expected policy from the untrusted envelope header.
+pub fn open_with_domain(
+    master: &SecretKey<MASTER_KEY_BYTES>,
+    domain: &[u8],
+    revision: u16,
+    binding: &[u8],
+    envelope: &[u8],
+) -> Result<SecretBytes, Error> {
+    validate_domain_binding(domain, binding)?;
+    if envelope.len() < HEADER_BYTES + NONCE_BYTES + TAG_BYTES
+        || envelope.len() > HEADER_BYTES + NONCE_BYTES + TAG_BYTES + MAX_PLAINTEXT_BYTES
     {
         return Err(Error::Malformed);
     }
-    if &envelope[..4] != MAGIC || u16::from_be_bytes([envelope[4], envelope[5]]) != D::REVISION {
+    if &envelope[..4] != MAGIC || u16::from_be_bytes([envelope[4], envelope[5]]) != revision {
         return Err(Error::WrongRevision);
     }
-    let key = derive_key::<D>(master, binding)?;
+    let key = derive_key(master, domain, binding)?;
     let cipher = Aes256Gcm::new_from_slice(&key[..]).map_err(|_| Error::Crypto)?;
-    let aad = aad::<D>(binding)?;
+    let aad = aad(domain, revision, binding)?;
     let plaintext = cipher
         .decrypt(
-            <&Nonce<aes_gcm::aead::consts::U12>>::try_from(&envelope[6..18])
-                .map_err(|_| Error::Malformed)?,
+            <&Nonce<aes_gcm::aead::consts::U12>>::try_from(
+                &envelope[HEADER_BYTES..HEADER_BYTES + NONCE_BYTES],
+            )
+            .map_err(|_| Error::Malformed)?,
             Payload {
-                msg: &envelope[18..],
+                msg: &envelope[HEADER_BYTES + NONCE_BYTES..],
                 aad: &aad,
             },
         )
@@ -91,23 +113,37 @@ pub fn open<D: EnvelopeDomain>(
     Ok(SecretBytes::new(plaintext))
 }
 
-fn derive_key<D: EnvelopeDomain>(
-    master: &SecretKey<32>,
+fn validate_domain_binding(domain: &[u8], binding: &[u8]) -> Result<(), Error> {
+    if domain.is_empty() || binding.is_empty() {
+        return Err(Error::MissingDomainBinding);
+    }
+    if domain.len() > MAX_DOMAIN_BYTES {
+        return Err(Error::DomainTooLarge);
+    }
+    if binding.len() > MAX_BINDING_BYTES {
+        return Err(Error::BindingTooLarge);
+    }
+    Ok(())
+}
+
+fn derive_key(
+    master: &SecretKey<MASTER_KEY_BYTES>,
+    domain: &[u8],
     binding: &[u8],
-) -> Result<Zeroizing<[u8; 32]>, Error> {
-    let hk = Hkdf::<Sha256>::new(Some(D::DOMAIN), master.expose());
-    let mut key = Zeroizing::new([0_u8; 32]);
+) -> Result<Zeroizing<[u8; MASTER_KEY_BYTES]>, Error> {
+    let hk = Hkdf::<Sha256>::new(Some(domain), master.expose());
+    let mut key = Zeroizing::new([0_u8; MASTER_KEY_BYTES]);
     hk.expand(binding, key.as_mut())
         .map_err(|_| Error::Crypto)?;
     Ok(key)
 }
-fn aad<D: EnvelopeDomain>(binding: &[u8]) -> Result<Vec<u8>, Error> {
-    let domain_len = u16::try_from(D::DOMAIN.len()).map_err(|_| Error::MissingDomainBinding)?;
+fn aad(domain: &[u8], revision: u16, binding: &[u8]) -> Result<Vec<u8>, Error> {
+    let domain_len = u16::try_from(domain.len()).map_err(|_| Error::MissingDomainBinding)?;
     let binding_len = u32::try_from(binding.len()).map_err(|_| Error::MissingDomainBinding)?;
-    let mut aad = Vec::with_capacity(8 + D::DOMAIN.len() + binding.len());
+    let mut aad = Vec::with_capacity(8 + domain.len() + binding.len());
     aad.extend_from_slice(&domain_len.to_be_bytes());
-    aad.extend_from_slice(D::DOMAIN);
-    aad.extend_from_slice(&D::REVISION.to_be_bytes());
+    aad.extend_from_slice(domain);
+    aad.extend_from_slice(&revision.to_be_bytes());
     aad.extend_from_slice(&binding_len.to_be_bytes());
     aad.extend_from_slice(binding);
     Ok(aad)
@@ -121,6 +157,8 @@ pub enum Error {
     PlaintextTooLarge,
     #[error("object binding exceeds the envelope budget")]
     BindingTooLarge,
+    #[error("envelope domain exceeds its byte budget")]
+    DomainTooLarge,
     #[error("malformed envelope")]
     Malformed,
     #[error("envelope revision does not match the current domain revision")]
@@ -152,7 +190,7 @@ mod tests {
             0xa8, 0x6f, 0x67, 0xeb,
         ];
         assert_eq!(
-            &derive_key::<Test>(&master, b"object-1").unwrap()[..],
+            &derive_key(&master, Test::DOMAIN, b"object-1").unwrap()[..],
             &expected_key
         );
         let envelope = [
@@ -171,18 +209,137 @@ mod tests {
             Error::Authentication
         );
         let cipher = Aes256Gcm::new_from_slice(&expected_key).unwrap();
-        let aad = aad::<Test>(b"object-1").unwrap();
+        let aad = aad(Test::DOMAIN, Test::REVISION, b"object-1").unwrap();
         let actual = cipher
             .encrypt(
-                <&Nonce<aes_gcm::aead::consts::U12>>::try_from(&envelope[6..18]).unwrap(),
+                <&Nonce<aes_gcm::aead::consts::U12>>::try_from(
+                    &envelope[HEADER_BYTES..HEADER_BYTES + NONCE_BYTES],
+                )
+                .unwrap(),
                 Payload {
                     msg: b"secret",
                     aad: &aad,
                 },
             )
             .unwrap();
-        assert_eq!(&actual, &envelope[18..]);
+        assert_eq!(&actual, &envelope[HEADER_BYTES + NONCE_BYTES..]);
     }
+    fn fixture_bytes(value: &serde_json::Value, field: &str) -> Vec<u8> {
+        let hex = value[field].as_str().unwrap();
+        assert_eq!(hex.len() % 2, 0);
+        hex.as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn public_vectors_verify_actual_kdf_aad_and_current_format() {
+        let vector: serde_json::Value =
+            serde_json::from_str(CURRENT_ENVELOPE_VALIDATION_VECTORS_JSON).unwrap();
+        let master = SecretKey::new(fixture_bytes(&vector, "master_hex").try_into().unwrap());
+        let domain = fixture_bytes(&vector, "domain_hex");
+        let binding = fixture_bytes(&vector, "binding_hex");
+        let envelope = fixture_bytes(&vector, "envelope_hex");
+        let revision = u16::try_from(vector["revision"].as_u64().unwrap()).unwrap();
+        assert_eq!(
+            derive_key(&master, &domain, &binding).unwrap().as_slice(),
+            fixture_bytes(&vector, "derived_key_hex")
+        );
+        assert_eq!(
+            aad(&domain, revision, &binding).unwrap(),
+            fixture_bytes(&vector, "aad_hex")
+        );
+        assert_eq!(
+            open_with_domain(&master, &domain, revision, &binding, &envelope)
+                .unwrap()
+                .expose(),
+            fixture_bytes(&vector, "plaintext_hex")
+        );
+        assert_eq!(
+            &envelope[HEADER_BYTES..HEADER_BYTES + NONCE_BYTES],
+            fixture_bytes(&vector, "nonce_hex")
+        );
+        assert_eq!(
+            envelope.len(),
+            HEADER_BYTES + NONCE_BYTES + TAG_BYTES + fixture_bytes(&vector, "plaintext_hex").len()
+        );
+    }
+
+    #[test]
+    fn dynamic_and_static_domains_use_one_current_format_and_reject_untrusted_metadata() {
+        let master = SecretKey::new([9; 32]);
+        let plaintext = SecretBytes::new(b"secret".to_vec());
+        let sealed = seal_with_domain(
+            &master,
+            Test::DOMAIN,
+            Test::REVISION,
+            b"object-1",
+            &plaintext,
+        )
+        .unwrap();
+        assert_eq!(
+            open::<Test>(&master, b"object-1", &sealed)
+                .unwrap()
+                .expose(),
+            b"secret"
+        );
+        let sealed = seal::<Test>(&master, b"object-1", &plaintext).unwrap();
+        assert_eq!(
+            open_with_domain(&master, Test::DOMAIN, Test::REVISION, b"object-1", &sealed)
+                .unwrap()
+                .expose(),
+            b"secret"
+        );
+        assert_eq!(
+            open_with_domain(
+                &master,
+                Test::DOMAIN,
+                Test::REVISION + 1,
+                b"object-1",
+                &sealed
+            )
+            .unwrap_err(),
+            Error::WrongRevision
+        );
+        assert_eq!(
+            open_with_domain(
+                &master,
+                b"different/domain",
+                Test::REVISION,
+                b"object-1",
+                &sealed
+            )
+            .unwrap_err(),
+            Error::Authentication
+        );
+        let mut wrong_magic = sealed.clone();
+        wrong_magic[0] ^= 1;
+        assert_eq!(
+            open_with_domain(
+                &master,
+                Test::DOMAIN,
+                Test::REVISION,
+                b"object-1",
+                &wrong_magic
+            )
+            .unwrap_err(),
+            Error::WrongRevision
+        );
+        let oversized_domain = vec![0; MAX_DOMAIN_BYTES + 1];
+        assert_eq!(
+            seal_with_domain(&master, &oversized_domain, 1, b"object-1", &plaintext),
+            Err(Error::DomainTooLarge)
+        );
+        let oversized_binding = vec![0; MAX_BINDING_BYTES + 1];
+        assert_eq!(
+            seal_with_domain(&master, Test::DOMAIN, 1, &oversized_binding, &plaintext),
+            Err(Error::BindingTooLarge)
+        );
+    }
+
     #[test]
     fn roundtrip_is_bound_to_object_and_tampering_fails() {
         let key = SecretKey::new([9; 32]);
