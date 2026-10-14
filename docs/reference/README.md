@@ -20,7 +20,7 @@
 - [当前 unsafe 审查](../unsafe-audit.md)
 - [0.10.0 逐函数审查记录](../unsafe-review-0.10.0.md)
 - [仓库和发布来源](../split-origin.md)
-- [1.0.5 发布说明](../releases/1.0.5.md)
+- [1.0.0 发布说明](../releases/1.0.0.md)
 
 审查中的历史测试数量对应其记录的源码；当前验证按[构建与测试](../development.md)执行。
 
