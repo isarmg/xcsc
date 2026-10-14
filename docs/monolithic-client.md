@@ -47,16 +47,14 @@ xcsc 的 Rust 部分只有根目录一个包 `xcsc`、一个 `Cargo.toml` 和一
 | `mobile-ffi` | `xcsc::mobile_ffi` | 只有导出 ABI 的库需要；必须使用 `panic=unwind`，abort-mode 明确编译失败 |
 | `jni` | `mobile-ffi` 和 JNI 适配 | 使用真实 Java 17 JVM 和移动运行时分别验收，不从 host 测试推导 Android 验收 |
 | `tracing` | `XcscStructuredLayer` | 客户端 tracing 事件产生客户端 scope；日志输出器失败仍可观察 |
-| `offline-maintenance` | Linux 的 `state_file`、SQLite 和所需原生 SQLite 依赖 | 非 Linux target 不编译这两个模块，也不引入 target-specific SQLite 依赖；xssc 使用此功能开关 |
+| `offline-maintenance` | Linux 的 `state_file`、SQLite 和所需原生 SQLite 依赖 | 正式维护目标为 Linux x86_64 GNU；非 Linux target 不编译这两个模块，也不引入 target-specific SQLite 依赖；xssi/xssc 使用此功能开关 |
 
-产品固定 `package=xcsc`、精确 `=1.0.1` 和正式发布的完整官方 Git revision，
+产品固定 `package=xcsc`、精确 `=1.0.0` 和正式发布的完整官方 Git revision，
 通过 `xcsc::<module>` 导入。消费清单 `xcsc-client.toml` 使用 `desktop-client`、
 `mobile-client` 或 `offline-maintenance` 能力配置。根门禁拒绝子 Cargo 包、
 工作区外壳；消费门禁核对所有 manifest、别名、target、patch/replace
 与实际 Cargo.lock，要求唯一官方 xcsc 包、精确版本和完整 Git revision。
-规范四字母 `product_id` 必须以 `c` 结尾；xczs、xsos、xscs、xszs、xcos、xocs
-等服务端不能通过声明客户端能力配置消费本库。非规范名称的通用测试测试夹具
-仍使用其原标识，不伪装成正式产品。
+职责由实际产品、能力配置和源码依赖核验，不按名称后缀推断。xczs、xsos、xscs、xszs、xcos、xocs 等服务端不能消费本库。xssi/xssc 只能声明 Linux x86_64 GNU 的 `offline-maintenance` 能力配置，必须实际启用同名 feature，不能声明桌面或移动能力、移动 feature、HTTP/Web adapter 或客户端队列限制。通用测试夹具保持自己的标识。
 
 ## 开发检查
 

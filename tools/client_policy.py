@@ -15,7 +15,9 @@ SEMVER = re.compile(
     r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
 )
 IDENTIFIER = re.compile(r"[a-z][a-z0-9-]{0,62}")
-CANONICAL_PRODUCT_ID = re.compile(r"x[a-z]{3}")
+SERVER_PRODUCTS = frozenset({"xczs", "xsos", "xscs", "xszs", "xcos", "xocs"})
+OFFLINE_MAINTENANCE_PRODUCTS = frozenset({"xssi", "xssc"})
+OFFLINE_MAINTENANCE_TARGET = "x86_64-unknown-linux-gnu"
 CLIENT_LIMIT_KEYS = {"max_record_bytes", "max_spool_bytes", "max_spool_entries"}
 EXPORTED_RUST_ABI = re.compile(
     r"#\[\s*(?:unsafe\s*\(\s*)?(?:no_mangle|export_name)\b"
@@ -184,8 +186,8 @@ def verify_manifest(product_root: Path, foundation_root: Path) -> dict[str, Any]
     product_id = manifest["product_id"]
     if manifest["format"] != 1 or not isinstance(product_id, str) or IDENTIFIER.fullmatch(product_id) is None:
         raise ConformanceError("product manifest: invalid format or product_id")
-    if CANONICAL_PRODUCT_ID.fullmatch(product_id) is not None and not product_id.endswith("c"):
-        raise ConformanceError("[client-role] canonical product_id must identify a Client with suffix c")
+    if product_id in SERVER_PRODUCTS:
+        raise ConformanceError("[client-role] server products cannot claim a client or maintenance Profile")
     foundation = manifest["foundation"]
     if not isinstance(foundation, dict):
         raise ConformanceError("product manifest.foundation: expected a table")
@@ -224,6 +226,11 @@ def verify_manifest(product_root: Path, foundation_root: Path) -> dict[str, Any]
         if not isinstance(profile_id, str) or profile_id not in profiles:
             raise ConformanceError(f"{context}.profile: unknown Profile {profile_id!r}")
         profile = profiles[profile_id]
+        if product_id in OFFLINE_MAINTENANCE_PRODUCTS:
+            if profile_id != "offline-maintenance":
+                raise ConformanceError(f"[maintenance-role] {context}: tool requires the offline-maintenance Profile")
+            if profile["formal_targets"] != [OFFLINE_MAINTENANCE_TARGET]:
+                raise ConformanceError(f"[maintenance-target] {context}: tool supports only {OFFLINE_MAINTENANCE_TARGET}")
         declared = set(_string_list(component["capabilities"], f"{context}.capabilities", allow_empty=False))
         required = set(profile["required_capabilities"])
         allowed = required | set(profile["optional_capabilities"])
@@ -385,11 +392,21 @@ def verify_source(product_root: Path, foundation_root: Path) -> dict[str, Any]:
     for path in sorted(cargo_manifests):
         for dependency, requirement in _walk_dependencies(_toml(path)):
             if isinstance(requirement, dict) and requirement.get("workspace") is True:
-                requirement = workspace.get(dependency, {})
+                inherited = workspace.get(dependency, {})
+                requirement = {
+                    **inherited,
+                    "features": sorted(set(inherited.get("features", [])) | set(requirement.get("features", []))),
+                } if isinstance(inherited, dict) else inherited
             package = requirement.get("package", dependency) if isinstance(requirement, dict) else dependency
+            if isinstance(requirement, dict) and requirement.get("git") == "https://github.com/isarmg/xcss.git":
+                findings.append(f"[client-role] {path}: official server foundation is outside the client and maintenance boundary")
             if isinstance(requirement, dict) and requirement.get("git") == "https://github.com/isarmg/xcsc.git" and package != "xcsc":
                 findings.append(f"[client-source-identity] {path}: official xcsc source declares an additional package {package}")
             if package == "xcsc":
+                if manifest["product_id"] in OFFLINE_MAINTENANCE_PRODUCTS and isinstance(requirement, dict):
+                    features = set(requirement.get("features", []))
+                    if "offline-maintenance" not in features or {"mobile-ffi", "jni"} & features:
+                        findings.append(f"[maintenance-features] {path}: tool must enable offline-maintenance without mobile features")
                 if not (
                     isinstance(requirement, dict)
                     and requirement.get("git") == "https://github.com/isarmg/xcsc.git"
@@ -404,6 +421,8 @@ def verify_source(product_root: Path, foundation_root: Path) -> dict[str, Any]:
                 elif client_revision != requirement["rev"]:
                     findings.append(f"[client-source-identity] {path}: xcsc packages use different source revisions")
     lock_path = product_root / "Cargo.lock"
+    if manifest["product_id"] in OFFLINE_MAINTENANCE_PRODUCTS and client_revision is None:
+        findings.append("[maintenance-features] tool requires a pinned official xcsc offline-maintenance dependency")
     if client_revision is not None:
         if not lock_path.exists():
             findings.append("[client-source-identity] pinned xcsc dependency requires a resolved Cargo.lock")

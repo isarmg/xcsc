@@ -19,7 +19,7 @@ source_roots = ["src"]
 
 [foundation]
 platform_generation = 1
-version = "1.0.1"
+version = "1.0.0"
 
 [[components]]
 id = "desktop"

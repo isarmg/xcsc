@@ -5,6 +5,7 @@ import json
 import re
 import tempfile
 import subprocess
+import shutil
 import unittest
 from pathlib import Path
 
@@ -185,15 +186,70 @@ class ClientPolicyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             product = Path(directory)
             manifest = product / "xcsc-client.toml"
-            for identifier in ("xczs", "xsos", "xscs", "xszs", "xcos", "xocs", "xabs"):
+            for identifier in ("xczs", "xsos", "xscs", "xszs", "xcos", "xocs"):
                 with self.subTest(server=identifier):
-                    manifest.write_text(VALID_MANIFEST.replace("fixture-product", identifier) + component)
-                    with self.assertRaisesRegex(ConformanceError, "client-role"):
-                        verify_manifest(product, ROOT)
-            for identifier in ("xsoc", "xscc", "xszc", "xcoc", "xssc", "xcsc", "fixture-product"):
+                    for profile in ("desktop-client", "offline-maintenance"):
+                        manifest.write_text(VALID_MANIFEST.replace("fixture-product", identifier) + component.replace("desktop-client", profile))
+                        with self.assertRaisesRegex(ConformanceError, "client-role"):
+                            verify_manifest(product, ROOT)
+            for identifier in ("xsoc", "xscc", "xszc", "xcoc", "xcsc", "xabs", "fixture-product"):
                 with self.subTest(client=identifier):
                     manifest.write_text(VALID_MANIFEST.replace("fixture-product", identifier) + component)
                     self.assertEqual(verify_manifest(product, ROOT)["product_id"], identifier)
+
+    def test_maintenance_tools_require_real_offline_roles_and_features(self) -> None:
+        component = '\n[[components]]\nid="setup"\nprofile="offline-maintenance"\ncapabilities=["private-state", "explicit-paths", "restore-journal", "linux-openat2", "offline-sqlite-maintenance"]\n'
+        requirement = 'xcsc={git="https://github.com/isarmg/xcsc.git",rev="' + 'a' * 40 + '",version="=0.5.0",features=["offline-maintenance"]}\n'
+        with tempfile.TemporaryDirectory() as directory:
+            product = Path(directory)
+            manifest = product / "xcsc-client.toml"
+            cargo = product / "Cargo.toml"
+            for identifier in ("xssi", "xssc"):
+                with self.subTest(tool=identifier):
+                    valid = VALID_MANIFEST.replace("fixture-product", identifier) + component
+                    manifest.write_text(valid)
+                    cargo.write_text('[dependencies]\n' + requirement)
+                    self.write_lock(product)
+                    self.assertEqual(verify_source(product, ROOT)["status"], "verified")
+                    for invalid in (
+                        valid.replace('profile="offline-maintenance"', 'profile="desktop-client"'),
+                        valid.replace('profile="offline-maintenance"', 'profile="mobile-client"'),
+                        valid.replace('"offline-sqlite-maintenance"', '"mobile-ffi"'),
+                        valid + 'http_adapter="hyper"\n',
+                        valid + 'web_profile="web-react-admin"\n',
+                        valid + 'client_limits={max_record_bytes=1,max_spool_bytes=1,max_spool_entries=1}\n',
+                    ):
+                        manifest.write_text(invalid)
+                        with self.assertRaises(ConformanceError):
+                            verify_manifest(product, ROOT)
+                    manifest.write_text(valid)
+                    for invalid in (
+                        requirement.replace('features=["offline-maintenance"]', 'features=[]'),
+                        requirement.replace('features=["offline-maintenance"]', 'features=["offline-maintenance","mobile-ffi"]'),
+                        requirement.replace('features=["offline-maintenance"]', 'features=["offline-maintenance","jni"]'),
+                        '',
+                    ):
+                        cargo.write_text('[dependencies]\n' + invalid)
+                        with self.assertRaisesRegex(ConformanceError, "maintenance-features"):
+                            verify_source(product, ROOT)
+                    cargo.write_text('[dependencies]\n' + requirement + 'alias={package="unrelated",git="https://github.com/isarmg/xcss.git",rev="' + 'b'*40 + '"}\n')
+                    with self.assertRaisesRegex(ConformanceError, "server foundation"):
+                        verify_source(product, ROOT)
+
+    def test_maintenance_profile_cannot_expand_its_formal_target(self) -> None:
+        component = '\n[[components]]\nid="setup"\nprofile="offline-maintenance"\ncapabilities=["private-state", "explicit-paths", "restore-journal", "linux-openat2", "offline-sqlite-maintenance"]\n'
+        with tempfile.TemporaryDirectory() as directory:
+            product = Path(directory) / "product"
+            product.mkdir()
+            (product / "xcsc-client.toml").write_text(VALID_MANIFEST.replace("fixture-product", "xssi") + component)
+            foundation = Path(directory) / "foundation"
+            shutil.copytree(ROOT / "profiles", foundation / "profiles")
+            profile = foundation / "profiles/offline-maintenance.toml"
+            original = profile.read_text()
+            for targets in ('["x86_64-pc-windows-msvc"]', '["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]', '[]'):
+                profile.write_text(original.replace('["x86_64-unknown-linux-gnu"]', targets))
+                with self.subTest(targets=targets), self.assertRaisesRegex(ConformanceError, "maintenance-target"):
+                    verify_manifest(product, foundation)
 
 
     def test_invalid_profile_types_produce_conformance_errors(self) -> None:

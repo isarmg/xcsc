@@ -17,13 +17,7 @@
     },
     "product_id": {
       "type": "string",
-      "pattern": "^[a-z][a-z0-9-]{0,62}$",
-      "allOf": [
-        {
-          "if": {"pattern": "^x[a-z]{3}$"},
-          "then": {"pattern": "^x[a-z]{2}c$"}
-        }
-      ]
+      "pattern": "^[a-z][a-z0-9-]{0,62}$"
     },
     "foundation": {
       "type": "object",
@@ -133,5 +127,63 @@
         "minLength": 1
       }
     }
-  }
+  },
+  "allOf": [
+    {
+      "not": {
+        "properties": {
+          "product_id": {
+            "enum": [
+              "xczs",
+              "xsos",
+              "xscs",
+              "xszs",
+              "xcos",
+              "xocs"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "product_id": {
+            "enum": [
+              "xssi",
+              "xssc"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "components": {
+            "items": {
+              "properties": {
+                "profile": {
+                  "const": "offline-maintenance"
+                },
+                "capabilities": {
+                  "type": "array",
+                  "uniqueItems": true,
+                  "minItems": 5,
+                  "maxItems": 5,
+                  "items": {
+                    "enum": [
+                      "private-state",
+                      "explicit-paths",
+                      "restore-journal",
+                      "linux-openat2",
+                      "offline-sqlite-maintenance"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
 }
