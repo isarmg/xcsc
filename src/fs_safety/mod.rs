@@ -403,6 +403,7 @@ impl PrivateDirectory {
 }
 
 pub struct AtomicFile;
+const ATOMIC_TEMPORARY_PREFIX: &str = ".state-atomic-";
 
 #[cfg(not(any(unix, windows)))]
 fn portable_files(
@@ -455,10 +456,12 @@ impl AtomicFile {
         }
     }
 
+    /// Recognize only the current atomic-write namespace, not arbitrary `.tmp` files.
+    /// Cleanup also requires exclusive application access to the directory.
     pub fn is_temporary_name(name: &EntryName) -> bool {
         name.as_os_str()
             .to_str()
-            .and_then(|value| value.strip_prefix(".xcsc-atomic-"))
+            .and_then(|value| value.strip_prefix(ATOMIC_TEMPORARY_PREFIX))
             .and_then(|value| value.strip_suffix(".tmp"))
             .is_some_and(|value| {
                 value.len() == 32
@@ -786,7 +789,7 @@ fn temporary_name() -> Result<String, Error> {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).map_err(|_| Error::Randomness)?;
     let nonce: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
-    Ok(format!(".xcsc-atomic-{nonce}.tmp"))
+    Ok(format!("{ATOMIC_TEMPORARY_PREFIX}{nonce}.tmp"))
 }
 
 #[cfg(target_os = "linux")]
@@ -823,6 +826,41 @@ pub enum Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn atomic_temporary_names_use_the_current_exact_namespace() {
+        let name = temporary_name().unwrap();
+        assert!(name.starts_with(".state-atomic-"));
+        assert!(AtomicFile::is_temporary_name(
+            &EntryName::new(name).unwrap()
+        ));
+        for name in [
+            ".state-atomic-0123456789abcdef0123456789abcdef.tmp",
+            ".state-atomic-00000000000000000000000000000000.tmp",
+            ".state-atomic-ffffffffffffffffffffffffffffffff.tmp",
+        ] {
+            assert!(AtomicFile::is_temporary_name(
+                &EntryName::new(name).unwrap()
+            ));
+        }
+        for name in [
+            "unowned.tmp",
+            ".xcsc-atomic-0123456789abcdef0123456789abcdef.tmp",
+            ".state-atomic-0123456789abcdef0123456789abcde.tmp",
+            ".state-atomic-0123456789abcdef0123456789abcdef0.tmp",
+            ".state-atomic-0123456789ABCDEF0123456789ABCDEF.tmp",
+            ".state-atomic-0123456789abcdef0123456789abcdeg.tmp",
+            ".state-atomic-0123456789abcdef0123456789abcdef",
+            ".state-atomic-0123456789abcdef0123456789abcdef.tmp.backup",
+            "prefix.state-atomic-0123456789abcdef0123456789abcdef.tmp",
+        ] {
+            assert!(
+                !AtomicFile::is_temporary_name(&EntryName::new(name).unwrap()),
+                "accepted {name}"
+            );
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_entry_names_reject_ads_and_win32_aliases() {

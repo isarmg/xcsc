@@ -14,9 +14,9 @@ Unix 上，`PrivateDirectory::create` 要求绝对路径，遍历已有祖先时
 
 ## 原子发布与锁
 
-`AtomicFile::replace` 写入并同步私有临时文件，在已持有目录内发布，检查发布后的 inode，再同步父目录。`AtomicFile::create` 使用不覆盖发布；冲突时保留原有文件。Unix 上新建文件、锁和私有子目录继承父目录的 uid/gid，私有文件及锁使用 0600 权限。
+`AtomicFile::replace` 写入并同步私有临时文件，原子发布后同步父目录。Unix 相对于已持有目录描述符发布并核对发布后的 inode；Windows 从已校验文件句柄重命名。`AtomicFile::create` 使用不覆盖发布；冲突时保留原有文件。Unix 上新建文件、锁和私有子目录继承父目录的 uid/gid，私有文件及锁使用 0600 权限。
 
-发布后的失败不证明已经回滚。尤其是 `PublishedDurabilityUnknown`，表示发布完成但父目录同步失败。调用方必须先依据恢复策略处理，再决定是否重试。临时名称使用 `AtomicFile::is_temporary_name` 识别的精确命名空间，清理前必须拥有应用排他的目录访问权。
+发布后的失败不证明已经回滚。尤其是 `PublishedDurabilityUnknown`，表示发布完成但父目录同步失败。调用方必须先依据恢复策略处理，再决定是否重试。临时名称遵循项目根目录《规范》附录 A 的公共运行接口约定，具体识别以 [`AtomicFile::is_temporary_name`](../src/fs_safety/mod.rs) 为准；随机部分严格为 32 个小写十六进制字符，后缀为 `.tmp`。清理前必须拥有应用排他的目录访问权；其他名称保留并按调用方策略拒绝，不做转换或扩大删除范围。
 
 `NoClobberPublish::publish` 接收私有目录及两个类型化名称，源文件必须是普通文件且只有一个硬链接。Linux 使用 `RENAME_NOREPLACE`，文件系统不支持时返回失败。其他 Unix 目标依次执行链接、父目录同步、取消源链接和再次同步父目录。失败时可能同时保留源文件及已发布证据。
 

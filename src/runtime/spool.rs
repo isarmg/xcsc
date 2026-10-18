@@ -525,7 +525,7 @@ mod tests {
             Spool::open(&path, limits()),
             Err(Error::AlreadyRunning)
         ));
-        let temporary = path.join(".xcsc-atomic-0123456789abcdef0123456789abcdef.tmp");
+        let temporary = path.join(".state-atomic-0123456789abcdef0123456789abcdef.tmp");
         fs::write(&temporary, b"unfinished write").unwrap();
         assert!(Spool::inspect_existing(&path, limits()).is_err());
         assert_eq!(fs::read(&temporary).unwrap(), b"unfinished write");
@@ -639,7 +639,7 @@ mod tests {
         );
         for text in [
             "unrecognized-file",
-            ".xcsc-atomic-0123456789abcdef0123456789abcdef.tmp",
+            ".state-atomic-0123456789abcdef0123456789abcdef.tmp",
         ] {
             let name = EntryName::new(text).unwrap();
             AtomicFile::create(&directory, &name, b"evidence").unwrap();
@@ -980,7 +980,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("spool");
         let spool = Spool::open(&path, limits()).unwrap();
-        let temporary = path.join(format!(".xcsc-atomic-{}.tmp", "a".repeat(32)));
+        let id = enqueue(&spool, 1, 100, vec![1, 2, 3]);
+        let temporary = path.join(".state-atomic-0123456789abcdef0123456789abcdef.tmp");
         AtomicFile::create(
             &spool.directory,
             &EntryName::new(temporary.file_name().unwrap()).unwrap(),
@@ -995,21 +996,35 @@ mod tests {
         drop(spool);
         let reopened = Spool::open(&path, limits()).unwrap();
         assert!(!temporary.exists());
-        drop(reopened);
-        let unrecognized = path.join("unowned.tmp");
-        let directory = PrivateDirectory::open_existing(&path).unwrap();
-        AtomicFile::create(
-            &directory,
-            &EntryName::new("unowned.tmp").unwrap(),
-            b"evidence",
-        )
-        .unwrap();
-        drop(directory);
-        assert!(matches!(
-            Spool::open(&path, limits()),
-            Err(Error::InvalidRecord)
-        ));
-        assert_eq!(fs::read(unrecognized).unwrap(), b"evidence");
+        let record = reopened.next().unwrap().unwrap();
+        assert_eq!(record.record_id, id);
+        assert_eq!(record.payload.as_slice(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn cleanup_preserves_names_outside_the_exact_current_namespace() {
+        for text in [
+            "unowned.tmp",
+            ".xcsc-atomic-0123456789abcdef0123456789abcdef.tmp",
+            ".state-atomic-0123456789abcdef0123456789abcde.tmp",
+            ".state-atomic-0123456789abcdef0123456789abcdef0.tmp",
+            ".state-atomic-0123456789ABCDEF0123456789ABCDEF.tmp",
+            ".state-atomic-0123456789abcdef0123456789abcdeg.tmp",
+            ".state-atomic-0123456789abcdef0123456789abcdef.tmp.backup",
+            "prefix.state-atomic-0123456789abcdef0123456789abcdef.tmp",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("spool");
+            let directory = PrivateDirectory::create(&path).unwrap();
+            let name = EntryName::new(text).unwrap();
+            AtomicFile::create(&directory, &name, b"evidence").unwrap();
+            drop(directory);
+            assert!(
+                matches!(Spool::open(&path, limits()), Err(Error::InvalidRecord)),
+                "accepted {text}"
+            );
+            assert_eq!(fs::read(path.join(text)).unwrap(), b"evidence");
+        }
     }
 
     #[test]
